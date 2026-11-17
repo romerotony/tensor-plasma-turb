@@ -1,0 +1,5 @@
+*.DS_Store
+.pixi/*
+!.pixi/config.toml
+results/
+__pycache__/

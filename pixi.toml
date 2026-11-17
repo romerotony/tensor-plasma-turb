@@ -1,0 +1,20 @@
+[workspace]
+authors = ["Tony Romero <tromero2500@gmail.com>"]
+channels = ["conda-forge"]
+name = "tensor-plasma-turb"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = ">=3.14,<3.15"
+numpy = ">=2.5.4,<3"
+matplotlib = ">=3.11.2,<4"
+scipy = ">=1.18.1,<2"
+quimb = ">=1.16.0,<2"
+h5py = ">=3.16.0,<4"
+seaborn = ">=0.13,<1"
+pandas = ">=2.2,<4"
+pysr = ">=2.7.2,<3"
+yt = ">=4.4.4,<5"
