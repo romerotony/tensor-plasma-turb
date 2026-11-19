@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 from typing import Any
 
+import cmasher as cmr
 import h5py
 import matplotlib
 import matplotlib.pyplot as plt
@@ -18,6 +19,7 @@ import quimb.tensor as qtn
 import seaborn as sns
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from matplotlib.transforms import blended_transform_factory
 from numpy.typing import NDArray
 from yt.loaders import load_uniform_grid
 from yt.utilities.logger import ytLogger
@@ -70,7 +72,7 @@ def select_snapshots(directory: pathlib.Path) -> list[Record]:
     stats = read_snapshot_stats(path)
     mach = stats["sonic_mach_number_mean"]
     max_mach = max(max_mach, mach)
-    print(f"t = {time:.2f}\t Mean Mach Number = {mach:.4f}")
+    print(f"t = {time:<6.2f}    Mean Mach Number = {mach:<8.4f}")
     if mach > MACH_THRESHOLD:
       started = True
     if started:
@@ -95,32 +97,36 @@ def discover_snapshots(directory: pathlib.Path) -> list[tuple[float, pathlib.Pat
 
 
 def read_snapshot_stats(path: pathlib.Path) -> dict[str, float]:
-  """Read mean sonic Mach and density bounds one mesh block at a time."""
+  """Read mean sonic Mach and central-slice density percentiles block by block."""
   with h5py.File(path, "r") as handle:
     gamma = float(handle["Params"].attrs["Hydro/AdiabaticIndex"])
     components = primitive_components(handle["Info"].attrs)
     prim = handle["prim"]
+    slice_z = int(handle["Info"].attrs["RootGridSize"][2]) // 2
+    block_nz = int(handle["Info"].attrs["MeshBlockSize"][2])
+    locations = handle["LogicalLocations"][:]
     indices = [components.index(name) for name in MACH_COMPONENTS]
     total = 0.0
     count = 0
-    density_min = float("inf")
-    density_max = -float("inf")
+    slice_planes = []
     for block in range(prim.shape[0]):
       rho, v1, v2, v3, pressure = [
         np.asarray(prim[block, index], dtype=np.float64) for index in indices
       ]
-      density_min = min(density_min, float(np.min(rho)))
-      density_max = max(density_max, float(np.max(rho)))
+      local_z = slice_z - int(locations[block, 2]) * block_nz
+      if 0 <= local_z < block_nz:
+        slice_planes.append(rho[local_z].ravel())
       rho = np.maximum(rho, EPS)
       pressure = np.maximum(pressure, 0.0)
       speed = np.sqrt(v1 * v1 + v2 * v2 + v3 * v3)
       sound_speed = np.maximum(np.sqrt(gamma * pressure / rho), EPS)
       total += float(np.sum(speed / sound_speed))
       count += rho.size
+  density_low, density_high = np.percentile(np.concatenate(slice_planes), [1, 99])
   return {
     "sonic_mach_number_mean": total / count,
-    "density_min": density_min,
-    "density_max": density_max,
+    "slice_density_p01": float(density_low),
+    "slice_density_p99": float(density_high),
   }
 
 
@@ -229,9 +235,9 @@ def plot_density_slices(
   output_path: pathlib.Path,
   color_limits: tuple[float, float],
 ) -> None:
-  """Render aligned central z slices with one fixed color scale for both fields."""
+  """Render aligned central z slices with a shared color scale for this frame."""
   ytLogger.setLevel("ERROR")
-  bbox = np.asarray(metadata["root_grid_domain"]).reshape(3, 3)[:, :2]
+  bbox = np.column_stack((np.full(3, -0.5), np.asarray(density.shape[::-1]) - 0.5))
   # Analysis arrays are (z, y, x); yt uniform grids expect (x, y, z).
   dataset = load_uniform_grid(
     {
@@ -253,7 +259,7 @@ def plot_density_slices(
     buff_size=(SLICE_RESOLUTION, SLICE_RESOLUTION),
   )
   plot.set_axes_unit("code_length")
-  cmap = sns.color_palette("mako", as_cmap=True)
+  cmap = cmr.cosmic
   for field in DENSITY_FIELDS:
     plot.set_unit(field, "code_density")
     plot.set_log(field, False)
@@ -261,17 +267,29 @@ def plot_density_slices(
     plot.set_zlim(field, *color_limits)
     plot.set_colorbar_label(field, "Density")
   fig = plot.export_to_mpl_figure((1, 2), axes_pad=0.6, cbar_mode="single", cbar_pad="3%")
-  fig.set_size_inches(12, 6)
-  for field, title in zip(DENSITY_FIELDS, ("Original density", "TT reconstruction")):
-    plot.plots[field].axes.set_title(title)
-  chi_1, chi_2 = metadata["bond_dimensions"]
+  fig.set_size_inches(12, 6.2)
+  fig.subplots_adjust(left=0.05, right=0.88, bottom=0.055, top=0.80)
+  cax = plot.plots[DENSITY_FIELDS[0]].cax
+  cax.tick_params(axis="y", which="both", labelsize=12)
+  cax.yaxis.set_label_coords(
+    0.945, 0.5, transform=blended_transform_factory(fig.transFigure, cax.transAxes)
+  )
+  font = plot.plots[DENSITY_FIELDS[0]].axes.xaxis.label.get_fontproperties()
+  for field, title in zip(DENSITY_FIELDS, ("Original Data", "TT Reconstruction")):
+    ax = plot.plots[field].axes
+    ax.set_title(title, fontproperties=font)
+    ax.set(xlabel="", ylabel="")
+    ax.tick_params(axis="both", which="both", labelsize=12)
+    ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+    ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
   simulation = pathlib.Path(metadata["source"]).parent.name.removeprefix("mach-")
   fig.suptitle(
-    rf"Mach {simulation} · $t={metadata['time']:.3f}$ · "
-    rf"$\epsilon={metadata['requested_epsilon']:g}$ · "
-    rf"$(\chi_1,\chi_2)=({chi_1},{chi_2})$ · "
-    f"Compression ratio: {metadata['compression_ratio']:.1f}×",
-    y=0.98,
+    rf"Density Slices - Mach {simulation} ($\epsilon={metadata['requested_epsilon']:g}$)"
+    "\n"
+    rf"$t = {metadata['time']:.2f}$"
+    f" - Compression Ratio: {metadata['compression_ratio']:.1f}×",
+    fontproperties=font,
+    y=0.96,
   )
   fig.savefig(output_path, dpi=200)
   plt.close(fig)
@@ -297,10 +315,10 @@ def build_analysis_record(metadata: Record) -> Record:
 
 def print_snapshot_summary(metadata: Record) -> None:
   error = metadata["relative_l2_error"]
-  error_text = f"{error:.3g}" if error is not None else "undefined"
+  error_text = f"{error:.4f}" if error is not None else "undefined"
   print(
-    f"  Bond Dims = {metadata['bond_dimensions']}\t"
-    f"Compression = {metadata['compression_ratio']:.2f}x\t"
+    f"  Bond Dims = {str(metadata['bond_dimensions']):<12}    "
+    f"Compression = {f'{metadata['compression_ratio']:.2f}x':<11}    "
     f"Relative L2 Error = {error_text}",
   )
 
@@ -333,7 +351,7 @@ def plot_results(records: list[Record], output_dir: pathlib.Path) -> pathlib.Pat
   plot_dir = output_dir.parent / "plots"
   plot_dir.mkdir(parents=True, exist_ok=True)
   simulation = pathlib.Path(records[0]["source"]).parent.name
-  output = plot_dir / f"{simulation}-tt-analysis.png"
+  output = plot_dir / f"tt-analysis-{simulation}.png"
   fig = make_figure(records)
   fig.savefig(output, dpi=180)
   plt.close(fig)
@@ -446,20 +464,26 @@ def create_animation(frame_dir: pathlib.Path, output_path: pathlib.Path) -> None
   print(f"Saved {output_path}")
 
 
+def slice_color_limits(snapshots: list[Record]) -> list[tuple[float, float]]:
+  """Smooth slice percentile limits with a centered three-frame average."""
+  limits = np.array(
+    [(snapshot["slice_density_p01"], snapshot["slice_density_p99"]) for snapshot in snapshots]
+  )
+  smoothed = [limits[max(0, index - 1) : index + 2].mean(axis=0) for index in range(len(limits))]
+  return [(float(low), float(high)) for low, high in smoothed]
+
+
 def main(argv: list[str] | None = None) -> None:
   matplotlib.use("Agg")
   args = parse_args(argv)
   snapshots = select_snapshots(args.input_dir)
+  color_limits = slice_color_limits(snapshots)
 
   metadata_records = []
   analysis_records = []
-  color_limits = (
-    min(snapshot["density_min"] for snapshot in snapshots),
-    max(snapshot["density_max"] for snapshot in snapshots),
-  )
   plot_dir = args.output_dir.parent / "plots"
   plot_dir.mkdir(parents=True, exist_ok=True)
-  animation = plot_dir / f"{args.input_dir.resolve().name}-density-comparison.mp4"
+  animation = plot_dir / f"density-comparison-{args.input_dir.resolve().name}.mp4"
   print("\n=== Running Tensor Train Analysis ===")
   with tempfile.TemporaryDirectory(dir=plot_dir, prefix=".density-frames-") as tmp:
     frame_dir = pathlib.Path(tmp)
@@ -467,7 +491,7 @@ def main(argv: list[str] | None = None) -> None:
       print(f"Decomposing Snapshot t = {snapshot['time']:.2f}")
       density, reconstructed, metadata = analyze_snapshot(snapshot)
       plot_density_slices(
-        density, reconstructed, metadata, frame_dir / f"{index}.png", color_limits
+        density, reconstructed, metadata, frame_dir / f"{index}.png", color_limits[index]
       )
       metadata_records.append(metadata)
       analysis_records.append(build_analysis_record(metadata))
