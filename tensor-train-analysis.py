@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import fcntl
 import gc
+import multiprocessing
+import os
 import pathlib
 import pickle
 import subprocess
@@ -30,10 +32,14 @@ type TensorTrain = tuple[FloatArray, FloatArray, FloatArray]
 type Record = dict[str, Any]
 
 DEFAULT_INPUT = pathlib.Path.home() / "data/turbulence-tensor-data/mach-0.5"
-DEFAULT_EPSILON = 0.01
+EPSILONS = (0.01, 0.005, 0.001)
+# Additional tolerances saved to the shared pickle, but excluded from plots.
+EXTRA_EPSILONS = (0.0025, 0.0075)
 MACH_THRESHOLD = 0.1
 SLICE_RESOLUTION = 800
-DENSITY_FIELDS = (("gas", "density"), ("gas", "density_reconstructed"))
+DENSITY_FIELDS = (("gas", "density"),) + tuple(
+  ("gas", f"density_reconstructed_{index}") for index in range(len(EPSILONS))
+)
 EPS = 1e-300
 MACH_COMPONENTS = (
   "prim_density",
@@ -63,27 +69,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def select_snapshots(directory: pathlib.Path) -> list[Record]:
-  """Read Mach once per output and retain everything after the first crossing."""
+  """Read snapshot statistics in parallel and retain outputs after the first crossing."""
   snapshots = []
   started = False
   max_mach = 0.0
   print("=== Calculating Mach Numbers ===")
-  for time, path in discover_snapshots(directory):
-    stats = read_snapshot_stats(path)
-    mach = stats["sonic_mach_number_mean"]
-    max_mach = max(max_mach, mach)
-    print(f"t = {time:<6.2f}    Mean Mach Number = {mach:<8.4f}")
-    if mach > MACH_THRESHOLD:
-      started = True
-    if started:
-      snapshots.append(
-        {
-          "path": path,
-          "time": time,
-          **stats,
-          "max_mach_number_so_far": max_mach,
-        }
-      )
+  outputs = discover_snapshots(directory)
+  with multiprocessing.Pool(processes=8) as pool:
+    stats_iter = pool.imap(read_snapshot_stats, (path for _, path in outputs))
+    for (time, path), stats in zip(outputs, stats_iter):
+      mach = stats["sonic_mach_number_mean"]
+      max_mach = max(max_mach, mach)
+      print(f"t = {time:<6.2f}    Mean Mach Number = {mach:<8.4f}")
+      if mach > MACH_THRESHOLD:
+        started = True
+      if started:
+        snapshots.append(
+          {
+            "path": path,
+            "time": time,
+            **stats,
+            "max_mach_number_so_far": max_mach,
+          }
+        )
   return snapshots
 
 
@@ -138,20 +146,24 @@ def primitive_components(info: h5py.AttributeManager) -> list[str]:
   return list(info["ComponentNames"])[offset : offset + counts[index]]
 
 
-def analyze_snapshot(snapshot: Record) -> tuple[FloatArray, FloatArray, Record]:
+def analyze_snapshot(snapshot: Record) -> tuple[FloatArray, list[FloatArray], list[Record]]:
   density, metadata = load_density(snapshot["path"])
-  cores = decompose_density(density)
-  reconstructed = reconstruct_density(cores)
-  metrics = reconstruction_metrics(density, reconstructed, cores)
-  metadata.update(metrics)
   metadata.update(
     {
       "sonic_mach_number_mean": snapshot["sonic_mach_number_mean"],
       "max_mach_number_so_far": snapshot["max_mach_number_so_far"],
-      "requested_epsilon": DEFAULT_EPSILON,
     }
   )
-  return density, reconstructed, metadata
+  reconstructions = []
+  records = []
+  for epsilon in (*EPSILONS, *EXTRA_EPSILONS):
+    cores = decompose_density(density, epsilon)
+    reconstructed = reconstruct_density(cores)
+    metrics = reconstruction_metrics(density, reconstructed, cores)
+    records.append({**metadata, **metrics, "requested_epsilon": epsilon})
+    if epsilon in EPSILONS:
+      reconstructions.append(reconstructed)
+  return density, reconstructions, records
 
 
 def load_density(path: pathlib.Path) -> tuple[FloatArray, Record]:
@@ -171,28 +183,27 @@ def load_density(path: pathlib.Path) -> tuple[FloatArray, Record]:
       "source": str(path.resolve()),
       "time": float(info["Time"]),
       "shape": list(density.shape),
-      "root_grid_domain": info["RootGridDomain"].tolist(),
       "forcing_accel_rms": float(handle["Params"].attrs["Hydro/turbulence/accel_rms"]),
     }
   return density, metadata
 
 
-def decompose_density(density: FloatArray) -> TensorTrain:
+def decompose_density(density: FloatArray, epsilon: float) -> TensorTrain:
   """Apply standard TT-SVD with equal absolute error budgets for the two splits."""
   mps = qtn.MatrixProductState.from_dense(
     density,
     dims=density.shape,
     method="svd",
-    cutoff=svd_cutoff(density),
+    cutoff=svd_cutoff(density, epsilon),
     cutoff_mode="sum2",
     renorm=False,
   )
   return extract_cores(mps)
 
 
-def svd_cutoff(density: FloatArray) -> float:
+def svd_cutoff(density: FloatArray, epsilon: float) -> float:
   density_norm = np.linalg.norm(density.astype(np.float64, copy=False))
-  return float((DEFAULT_EPSILON * density_norm) ** 2 / 2)
+  return float((epsilon * density_norm) ** 2 / 2)
 
 
 def extract_cores(mps: qtn.MatrixProductState) -> TensorTrain:
@@ -230,19 +241,21 @@ def reconstruction_metrics(
 
 def plot_density_slices(
   density: FloatArray,
-  reconstructed: FloatArray,
-  metadata: Record,
+  reconstructions: list[FloatArray],
+  records: list[Record],
   output_path: pathlib.Path,
   color_limits: tuple[float, float],
 ) -> None:
   """Render aligned central z slices with a shared color scale for this frame."""
   ytLogger.setLevel("ERROR")
+  metadata = records[0]
+  fields = [DENSITY_FIELDS[0], *reversed(DENSITY_FIELDS[1:])]
   bbox = np.column_stack((np.full(3, -0.5), np.asarray(density.shape[::-1]) - 0.5))
   # Analysis arrays are (z, y, x); yt uniform grids expect (x, y, z).
   dataset = load_uniform_grid(
     {
-      DENSITY_FIELDS[0]: (density.transpose(2, 1, 0), "code_density"),
-      DENSITY_FIELDS[1]: (reconstructed.transpose(2, 1, 0), "code_density"),
+      field: (array.transpose(2, 1, 0), "code_density")
+      for field, array in zip(DENSITY_FIELDS, [density, *reconstructions])
     },
     density.shape[::-1],
     bbox=bbox,
@@ -252,30 +265,37 @@ def plot_density_slices(
   plot = SlicePlot(
     dataset,
     "z",
-    list(DENSITY_FIELDS),
+    fields,
     center=bbox.mean(axis=1),
     width=(bbox[0, 1] - bbox[0, 0], bbox[1, 1] - bbox[1, 0]),
     origin="native",
     buff_size=(SLICE_RESOLUTION, SLICE_RESOLUTION),
   )
   plot.set_axes_unit("code_length")
-  cmap = cmr.cosmic
   for field in DENSITY_FIELDS:
     plot.set_unit(field, "code_density")
     plot.set_log(field, False)
-    plot.set_cmap(field, cmap)
+    plot.set_cmap(field, cmr.cosmic)
     plot.set_zlim(field, *color_limits)
     plot.set_colorbar_label(field, "Density")
-  fig = plot.export_to_mpl_figure((1, 2), axes_pad=0.6, cbar_mode="single", cbar_pad="3%")
-  fig.set_size_inches(12, 6.2)
-  fig.subplots_adjust(left=0.05, right=0.88, bottom=0.055, top=0.80)
+  fig = plot.export_to_mpl_figure(
+    (1, len(DENSITY_FIELDS)), axes_pad=0.6, cbar_mode="single", cbar_pad="3%"
+  )
+  fig.set_size_inches(5.2 * len(DENSITY_FIELDS), 6.5)
+  fig.subplots_adjust(left=0.02, right=0.96, bottom=0.045, top=0.73)
   cax = plot.plots[DENSITY_FIELDS[0]].cax
   cax.tick_params(axis="y", which="both", labelsize=12)
   cax.yaxis.set_label_coords(
-    0.945, 0.5, transform=blended_transform_factory(fig.transFigure, cax.transAxes)
+    0.985, 0.5, transform=blended_transform_factory(fig.transFigure, cax.transAxes)
   )
   font = plot.plots[DENSITY_FIELDS[0]].axes.xaxis.label.get_fontproperties()
-  for field, title in zip(DENSITY_FIELDS, ("Original Data", "TT Reconstruction")):
+  titles = ["Original Data"] + [
+    rf"TT Reconstruction ($\epsilon={record['requested_epsilon']:g}$)"
+    "\n"
+    f"Compression Ratio: {record['compression_ratio']:.1f}×"
+    for record in reversed(records)
+  ]
+  for field, title in zip(fields, titles):
     ax = plot.plots[field].axes
     ax.set_title(title, fontproperties=font)
     ax.set(xlabel="", ylabel="")
@@ -284,14 +304,13 @@ def plot_density_slices(
     ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
   simulation = pathlib.Path(metadata["source"]).parent.name.removeprefix("mach-")
   fig.suptitle(
-    rf"Density Slices - Mach {simulation} ($\epsilon={metadata['requested_epsilon']:g}$)"
+    f"Density Slices - Mach {simulation}"
     "\n"
-    rf"$t = {metadata['time']:.2f}$"
-    f" - Compression Ratio: {metadata['compression_ratio']:.1f}×",
+    rf"$t = {metadata['time']:.2f}$",
     fontproperties=font,
     y=0.96,
   )
-  fig.savefig(output_path, dpi=200)
+  fig.savefig(output_path, dpi=150)
   plt.close(fig)
   del plot, dataset
   gc.collect()
@@ -315,10 +334,11 @@ def build_analysis_record(metadata: Record) -> Record:
 
 def print_snapshot_summary(metadata: Record) -> None:
   error = metadata["relative_l2_error"]
-  error_text = f"{error:.4f}" if error is not None else "undefined"
+  error_text = f"{error:.6f}" if error is not None else "undefined"
   print(
-    f"  Bond Dims = {str(metadata['bond_dimensions']):<12}    "
-    f"Compression = {f'{metadata['compression_ratio']:.2f}x':<11}    "
+    f"  Epsilon = {metadata['requested_epsilon']:<6g} "
+    f"Bond Dims = {str(metadata['bond_dimensions']):<12} "
+    f"Compression = {f'{metadata['compression_ratio']:.2f}x':<11} "
     f"Relative L2 Error = {error_text}",
   )
 
@@ -346,7 +366,7 @@ def update_analysis_pickle(records: list[Record], output_path: pathlib.Path) -> 
   print(f"Saved Snapshot Records: {output_path}")
 
 
-def plot_results(records: list[Record], output_dir: pathlib.Path) -> pathlib.Path:
+def plot_results(records: list[Record], output_dir: pathlib.Path) -> None:
   matplotlib.use("Agg")
   plot_dir = output_dir.parent / "plots"
   plot_dir.mkdir(parents=True, exist_ok=True)
@@ -356,7 +376,6 @@ def plot_results(records: list[Record], output_dir: pathlib.Path) -> pathlib.Pat
   fig.savefig(output, dpi=180)
   plt.close(fig)
   print(f"Saved {output}")
-  return output
 
 
 def make_figure(records: list[Record]) -> Figure:
@@ -377,32 +396,49 @@ def make_figure(records: list[Record]) -> Figure:
 
 
 def _make_figure(records: list[Record]) -> Figure:
-  times = np.array([record["time"] for record in records])
-  ranks = np.array([record["bond_dimensions"] for record in records])
-  compression = np.array([record["compression_ratio"] for record in records])
-  mach = np.array([record["sonic_mach_number_mean"] for record in records])
+  mach_records = [record for record in records if record["requested_epsilon"] == EPSILONS[0]]
+  times = np.array([record["time"] for record in mach_records])
+  mach = np.array([record["sonic_mach_number_mean"] for record in mach_records])
   simulation = pathlib.Path(records[0]["source"]).parent.name.removeprefix("mach-")
-  epsilon = records[0]["requested_epsilon"]
   palette = sns.color_palette("deep")
-  fig, axes = plt.subplots(3, 1, sharex=True, figsize=(9, 8.5), layout="constrained")
-  fig.suptitle(rf"Tensor-Train Results - Mach {simulation} ($\epsilon = {epsilon:g}$)")
+  fig, axes = plt.subplots(3, 1, sharex=True, figsize=(11, 8.5), layout="constrained")
+  fig.suptitle(f"Tensor Train Results - Mach {simulation}")
   mach_ax, rank_ax, compression_ax = axes
 
-  plot_series(mach_ax, times, mach, marker="o", color=palette[0])
+  plot_series(mach_ax, times, mach, color=palette[0])
   mach_ax.set_ylabel("Mean Sonic Mach Number")
   mach_ax.set_ylim(bottom=0)
-  plot_series(rank_ax, times, ranks[:, 0], label=r"$\chi_1$", marker="o", color=palette[1])
-  plot_series(rank_ax, times, ranks[:, 1], label=r"$\chi_2$", marker="o", color=palette[2])
+  for epsilon, color in zip(EPSILONS, palette[1 : 1 + len(EPSILONS)]):
+    group = [record for record in records if record["requested_epsilon"] == epsilon]
+    group_times = np.array([record["time"] for record in group])
+    ranks = np.array([record["bond_dimensions"] for record in group])
+    compression = np.array([record["compression_ratio"] for record in group])
+    for index in range(2):
+      plot_series(
+        rank_ax,
+        group_times,
+        ranks[:, index],
+        label=rf"$\epsilon={epsilon:g},\ \chi_{index + 1}$",
+        linestyle="-",
+        color=tuple(channel + 0.3 * (1 - channel) for channel in color) if index == 0 else color,
+      )
+    plot_series(
+      compression_ax,
+      group_times,
+      compression,
+      label=rf"$\epsilon={epsilon:g}$",
+      color=color,
+    )
   rank_ax.set_ylabel("Bond Dimension")
   rank_ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-  rank_ax.legend()
-  plot_series(compression_ax, times, compression, marker="o", color=palette[3])
+  rank_ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize="small")
+  compression_ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
   compression_ax.set_yscale("log")
   compression_ax.set_ylim(bottom=1)
   compression_ax.set_ylabel("Compression Ratio")
   compression_ax.set_xlabel("Simulation Time")
 
-  driving_end = driving_disabled_time(records)
+  driving_end = driving_disabled_time(mach_records)
   for ax in axes:
     if driving_end is not None:
       ax.axvline(driving_end, color="0.35", linestyle="--", linewidth=1.2)
@@ -421,7 +457,6 @@ def plot_series(ax: Axes, times: FloatArray, values: NDArray[np.number[Any]], **
     errorbar=None,
     sort=False,
     linewidth=1.8,
-    markersize=7,
     **style,
   )
 
@@ -455,8 +490,10 @@ def create_animation(frame_dir: pathlib.Path, output_path: pathlib.Path) -> None
       "libx264",
       "-pix_fmt",
       "yuv420p",
-      "-b:v",
-      "8M",
+      "-crf",
+      "20",
+      "-preset",
+      "slow",
       str(output_path),
     ],
     check=True,
@@ -473,9 +510,31 @@ def slice_color_limits(snapshots: list[Record]) -> list[tuple[float, float]]:
   return [(float(low), float(high)) for low, high in smoothed]
 
 
+def process_snapshot(
+  task: tuple[Record, pathlib.Path, tuple[float, float]],
+) -> list[Record]:
+  """Analyze and render one snapshot without sending dense arrays between processes."""
+  matplotlib.use("Agg")
+  snapshot, frame_path, color_limits = task
+  density, reconstructions, records = analyze_snapshot(snapshot)
+  plot_records = [record for record in records if record["requested_epsilon"] in EPSILONS]
+  plot_density_slices(density, reconstructions, plot_records, frame_path, color_limits)
+  return records
+
+
 def main(argv: list[str] | None = None) -> None:
   matplotlib.use("Agg")
   args = parse_args(argv)
+  # Spawned workers inherit these limits before importing numerical libraries.
+  for name in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMBA_NUM_THREADS",
+    "QUIMB_NUM_THREAD_WORKERS",
+  ):
+    os.environ[name] = "1"
   snapshots = select_snapshots(args.input_dir)
   color_limits = slice_color_limits(snapshots)
 
@@ -487,16 +546,24 @@ def main(argv: list[str] | None = None) -> None:
   print("\n=== Running Tensor Train Analysis ===")
   with tempfile.TemporaryDirectory(dir=plot_dir, prefix=".density-frames-") as tmp:
     frame_dir = pathlib.Path(tmp)
-    for index, snapshot in enumerate(snapshots):
-      print(f"Decomposing Snapshot t = {snapshot['time']:.2f}")
-      density, reconstructed, metadata = analyze_snapshot(snapshot)
-      plot_density_slices(
-        density, reconstructed, metadata, frame_dir / f"{index}.png", color_limits[index]
-      )
-      metadata_records.append(metadata)
-      analysis_records.append(build_analysis_record(metadata))
-      print_snapshot_summary(metadata)
-      del density, reconstructed
+    tasks = (
+      (snapshot, frame_dir / f"{index}.png", color_limits[index])
+      for index, snapshot in enumerate(snapshots)
+    )
+    with multiprocessing.get_context("spawn").Pool(processes=8) as pool:
+      results = pool.imap(process_snapshot, tasks, chunksize=1)
+      for snapshot, records in zip(snapshots, results):
+        print(
+          f"Decomposing Snapshot t = {snapshot['time']:<6.2f} "
+          f"Mean Mach Number = {snapshot['sonic_mach_number_mean']:.4f}",
+          flush=True,
+        )
+        metadata_records.extend(
+          record for record in records if record["requested_epsilon"] in EPSILONS
+        )
+        analysis_records.extend(build_analysis_record(record) for record in records)
+        for record in sorted(records, key=lambda record: record["requested_epsilon"], reverse=True):
+          print_snapshot_summary(record)
     print("\n=== Saving Results ===")
     create_animation(frame_dir, animation)
   update_analysis_pickle(analysis_records, args.output_dir.parent / "tt-analysis.pkl")

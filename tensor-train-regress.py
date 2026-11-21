@@ -24,7 +24,7 @@ type Summary = dict[str, Any]
 
 INPUT_FILE = pathlib.Path("results/tt-analysis.pkl")
 OUTPUT_DIR = pathlib.Path("results/regression")
-FEATURE_NAMES = ("mach_number", "max_mach_number_so_far")
+FEATURE_NAMES = ("mach_number", "max_mach_number_so_far", "epsilon")
 TEST_FRACTION = 0.2
 N_ITERATIONS = 500
 MAX_SIZE = 15
@@ -45,9 +45,7 @@ def load_data(input_file: pathlib.Path) -> pd.DataFrame:
   """Load and sort the shared snapshot table."""
   with input_file.open("rb") as handle:
     data = pd.DataFrame(pickle.load(handle))
-  data["simulation_path"] = data["snapshot"].map(
-    lambda path: str(pathlib.Path(path).parent)
-  )
+  data["simulation_path"] = data["snapshot"].map(lambda path: str(pathlib.Path(path).parent))
   return data.sort_values(
     ["simulation", "simulation_path", "time"], kind="stable"
   ).reset_index(drop=True)
@@ -122,7 +120,7 @@ def save_results(
     "equation_compression": f"exp({log_equation})",
     "complexity": int(best["complexity"]),
     "training_log_loss": float(best["loss"]),
-    "epsilon": float(data["epsilon"].iloc[0]),
+    "epsilons": sorted(data["epsilon"].unique().tolist()),
     "resolution": int(data["resolution"].iloc[0]),
     "simulations": sorted(data["simulation"].unique().tolist()),
     "niterations": N_ITERATIONS,
@@ -167,8 +165,12 @@ def plot_predictions(data: pd.DataFrame, output_dir: pathlib.Path) -> None:
     ):
       group = data[data["split"] == split]
       sns.scatterplot(
-        x=group["compression_ratio"], y=group["predicted_compression_ratio"],
-        label=label, marker=marker, s=65, ax=ax,
+        x=group["compression_ratio"],
+        y=group["predicted_compression_ratio"],
+        label=label,
+        marker=marker,
+        s=65,
+        ax=ax,
       )
     values = data[["compression_ratio", "predicted_compression_ratio"]].to_numpy()
     lower, upper = values.min(), values.max()
