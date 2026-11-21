@@ -152,6 +152,9 @@ def analyze_snapshot(snapshot: Record) -> tuple[FloatArray, list[FloatArray], li
     {
       "sonic_mach_number_mean": snapshot["sonic_mach_number_mean"],
       "max_mach_number_so_far": snapshot["max_mach_number_so_far"],
+      "density_contrast": float(
+        np.std(density, dtype=np.float64) / np.mean(density, dtype=np.float64)
+      ),
     }
   )
   reconstructions = []
@@ -324,6 +327,8 @@ def build_analysis_record(metadata: Record) -> Record:
     "time": float(metadata["time"]),
     "mach_number": float(metadata["sonic_mach_number_mean"]),
     "max_mach_number_so_far": float(metadata["max_mach_number_so_far"]),
+    "driving_off": int(metadata["forcing_accel_rms"] == 0),
+    "density_contrast": metadata["density_contrast"],
     "epsilon": float(metadata["requested_epsilon"]),
     "resolution": int(metadata["shape"][0]),
     "chi_1": int(metadata["bond_dimensions"][0]),
