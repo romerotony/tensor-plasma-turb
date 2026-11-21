@@ -1,0 +1,35 @@
+#!/bin/bash --login
+#SBATCH --job-name=tt-analysis
+#SBATCH --account=galaxies
+#SBATCH --partition=general-short
+#SBATCH --time=04:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --hint=nomultithread
+#SBATCH --mem=16G
+
+set -eo pipefail
+
+repo=/mnt/ffs24/home/romeroa8/git/tensor-plasma-turb
+pixi=/mnt/home/romeroa8/.pixi/bin/pixi
+input_dir=${1:?Usage: sbatch launch-tt-analysis.sb /path/to/mach-directory}
+
+if [[ ! -d "$input_dir" ]]; then
+    printf 'Input directory not found: %s\n' "$input_dir" >&2
+    exit 1
+fi
+input_dir=$(cd -- "$input_dir" && pwd -P)
+
+module purge
+module load FFmpeg/7.1.1-GCCcore-14.2.0
+
+export MPLBACKEND=Agg
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1 NUMBA_NUM_THREADS=1 QUIMB_NUM_THREAD_WORKERS=1
+
+cd -- "$repo"
+srun "$pixi" run --as-is --manifest-path "$repo/pixi.toml" --executable \
+    python -u "$repo/tensor-train-analysis.py" \
+    --input-dir "$input_dir" \
+    --output-dir "$repo/results/${input_dir##*/}"

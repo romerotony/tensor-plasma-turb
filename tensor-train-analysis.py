@@ -73,14 +73,14 @@ def select_snapshots(directory: pathlib.Path) -> list[Record]:
   snapshots = []
   started = False
   max_mach = 0.0
-  print("=== Calculating Mach Numbers ===")
+  print("=== Calculating Mach Numbers ===", flush=True)
   outputs = discover_snapshots(directory)
   with multiprocessing.Pool(processes=8) as pool:
     stats_iter = pool.imap(read_snapshot_stats, (path for _, path in outputs))
     for (time, path), stats in zip(outputs, stats_iter):
       mach = stats["sonic_mach_number_mean"]
       max_mach = max(max_mach, mach)
-      print(f"t = {time:<6.2f}    Mean Mach Number = {mach:<8.4f}")
+      print(f"t = {time:<6.2f}    Mean Mach Number = {mach:<8.4f}", flush=True)
       if mach > MACH_THRESHOLD:
         started = True
       if started:
@@ -340,6 +340,7 @@ def print_snapshot_summary(metadata: Record) -> None:
     f"Bond Dims = {str(metadata['bond_dimensions']):<12} "
     f"Compression = {f'{metadata['compression_ratio']:.2f}x':<11} "
     f"Relative L2 Error = {error_text}",
+    flush=True,
   )
 
 
@@ -363,7 +364,7 @@ def update_analysis_pickle(records: list[Record], output_path: pathlib.Path) -> 
       with temporary.open("wb") as handle:
         pickle.dump(rows, handle, protocol=pickle.HIGHEST_PROTOCOL)
       temporary.replace(output_path)
-  print(f"Saved Snapshot Records: {output_path}")
+  print(f"Saved Snapshot Records: {output_path}", flush=True)
 
 
 def plot_results(records: list[Record], output_dir: pathlib.Path) -> None:
@@ -375,7 +376,7 @@ def plot_results(records: list[Record], output_dir: pathlib.Path) -> None:
   fig = make_figure(records)
   fig.savefig(output, dpi=180)
   plt.close(fig)
-  print(f"Saved {output}")
+  print(f"Saved {output}", flush=True)
 
 
 def make_figure(records: list[Record]) -> Figure:
@@ -498,7 +499,7 @@ def create_animation(frame_dir: pathlib.Path, output_path: pathlib.Path) -> None
     ],
     check=True,
   )
-  print(f"Saved {output_path}")
+  print(f"Saved {output_path}", flush=True)
 
 
 def slice_color_limits(snapshots: list[Record]) -> list[tuple[float, float]]:
@@ -543,7 +544,7 @@ def main(argv: list[str] | None = None) -> None:
   plot_dir = args.output_dir.parent / "plots"
   plot_dir.mkdir(parents=True, exist_ok=True)
   animation = plot_dir / f"density-comparison-{args.input_dir.resolve().name}.mp4"
-  print("\n=== Running Tensor Train Analysis ===")
+  print("\n=== Running Tensor Train Analysis ===", flush=True)
   with tempfile.TemporaryDirectory(dir=plot_dir, prefix=".density-frames-") as tmp:
     frame_dir = pathlib.Path(tmp)
     tasks = (
@@ -564,7 +565,7 @@ def main(argv: list[str] | None = None) -> None:
         analysis_records.extend(build_analysis_record(record) for record in records)
         for record in sorted(records, key=lambda record: record["requested_epsilon"], reverse=True):
           print_snapshot_summary(record)
-    print("\n=== Saving Results ===")
+    print("\n=== Saving Results ===", flush=True)
     create_animation(frame_dir, animation)
   update_analysis_pickle(analysis_records, args.output_dir.parent / "tt-analysis.pkl")
   plot_results(metadata_records, args.output_dir)
